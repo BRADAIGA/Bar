@@ -41,6 +41,7 @@ jobs:
           REPOSITORY='BRADAIGA/Bar'
           API='https://api.github.com/repos/'+REPOSITORY
           ARCHIVE='WarmCorner-Windows.zip'
+          MAX_PARTS=128
           
           def require(condition, message):
               if not condition:raise ValueError(message)
@@ -51,7 +52,7 @@ jobs:
               require(isinstance(manifest.get('version'),str) and re.fullmatch(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?',manifest['version']),'Invalid version')
               require(isinstance(manifest.get('sha256'),str) and re.fullmatch('[a-f0-9]{64}',manifest['sha256']),'Invalid digest')
               require(type(manifest.get('size')) is int and 0<manifest['size']<2*1024**3,'Invalid size')
-              parts=manifest.get('parts');require(isinstance(parts,list) and 1<=len(parts)<=64,'Invalid part count')
+              parts=manifest.get('parts');require(isinstance(parts,list) and 1<=len(parts)<=MAX_PARTS,'Invalid part count')
               for i,p in enumerate(parts):
                   require(isinstance(p,dict) and p.get('name')==ARCHIVE+'.part-'+f'{i:04d}','Part order/name mismatch')
                   require(type(p.get('size')) is int and 0<p['size']<=64*1024**2,'Invalid part size')
@@ -65,6 +66,17 @@ jobs:
               require(a.get('state')=='uploaded' and a.get('size')==size and a.get('digest')=='sha256:'+sha,'Unverified asset: '+name)
               require(type(a.get('id')) is int and a['id']>0,'Invalid asset id')
               return a
+          
+          def source_tag_matches(source_tag,version):
+              return source_tag in ('upload-'+version,'upload-small-'+version)
+          
+          def list_assets(get_json,release_id):
+              result=[]
+              for page in range(1,7):
+                  chunk=get_json('/releases/'+str(release_id)+'/assets?per_page=100&page='+str(page))
+                  require(isinstance(chunk,list),'Invalid asset page');result.extend(chunk)
+                  if len(chunk)<100:return result
+              raise ValueError('Unexpected transport asset count')
           
           def assemble(manifest,open_part,output):
               validate(manifest);whole=hashlib.sha256();total=0
@@ -102,10 +114,9 @@ jobs:
                   r=get_json('/releases/'+release_id)
                   require(r['draft'] and r['tag_name']==os.environ['RELEASE_TAG'],'Release changed or already published')
                   source=get_json('/releases/'+source_id)
-                  require(source['draft'] and source['tag_name']=='upload-'+r['tag_name'],'Source release changed or published')
+                  require(source['draft'] and source_tag_matches(source['tag_name'],r['tag_name']),'Source release changed or published')
                   return r
-              r=release();assets=get_json('/releases/'+source_id+'/assets?per_page=100')
-              require(len(assets)<100,'Unexpected asset count')
+              r=release();assets=list_assets(get_json,source_id)
               descriptors=[a for a in assets if a['name']=='upload-parts.json']
               require(len(descriptors)==1 and 0<descriptors[0]['size']<32768,'Missing bounded part manifest')
               desc=select_asset(assets,'upload-parts.json',descriptors[0]['size'],expected)
