@@ -1,0 +1,137 @@
+name: Verify and assemble release archive
+on:
+  workflow_dispatch:
+    inputs:
+      source_release_id:
+        required: true
+        type: string
+      target_release_id:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+      manifest_sha256:
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: release-assembly-${{ inputs.target_release_id }}
+  cancel-in-progress: false
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Verify every transport part and assemble the unchanged launcher ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_RELEASE_ID: ${{ inputs.source_release_id }}
+          TARGET_RELEASE_ID: ${{ inputs.target_release_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          """Manual GitHub runner assembly of verified transport parts; never publishes."""
+          import hashlib, http.client, io, json, os, re, tempfile, urllib.request, urllib.error, urllib.parse
+          from pathlib import Path
+          
+          REPOSITORY='BRADAIGA/Bar'
+          API='https://api.github.com/repos/'+REPOSITORY
+          ARCHIVE='WarmCorner-Windows.zip'
+          
+          def require(condition, message):
+              if not condition:raise ValueError(message)
+          
+          def validate(manifest):
+              require(isinstance(manifest,dict),'Manifest must be an object')
+              require(manifest.get('format')==1 and manifest.get('archive')==ARCHIVE,'Unsupported archive')
+              require(isinstance(manifest.get('version'),str) and re.fullmatch(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?',manifest['version']),'Invalid version')
+              require(isinstance(manifest.get('sha256'),str) and re.fullmatch('[a-f0-9]{64}',manifest['sha256']),'Invalid digest')
+              require(type(manifest.get('size')) is int and 0<manifest['size']<2*1024**3,'Invalid size')
+              parts=manifest.get('parts');require(isinstance(parts,list) and 1<=len(parts)<=64,'Invalid part count')
+              for i,p in enumerate(parts):
+                  require(isinstance(p,dict) and p.get('name')==ARCHIVE+'.part-'+f'{i:04d}','Part order/name mismatch')
+                  require(type(p.get('size')) is int and 0<p['size']<=64*1024**2,'Invalid part size')
+                  require(isinstance(p.get('sha256'),str) and re.fullmatch('[a-f0-9]{64}',p['sha256']),'Invalid part digest')
+              require(sum(p['size'] for p in parts)==manifest['size'],'Total size mismatch')
+          
+          def select_asset(assets,name,size,sha):
+              matches=[a for a in assets if a.get('name')==name]
+              require(len(matches)==1,'Missing or duplicated asset: '+name)
+              a=matches[0]
+              require(a.get('state')=='uploaded' and a.get('size')==size and a.get('digest')=='sha256:'+sha,'Unverified asset: '+name)
+              require(type(a.get('id')) is int and a['id']>0,'Invalid asset id')
+              return a
+          
+          def assemble(manifest,open_part,output):
+              validate(manifest);whole=hashlib.sha256();total=0
+              for p in manifest['parts']:
+                  digest=hashlib.sha256();count=0
+                  with open_part(p) as stream:
+                      while data:=stream.read(1024*1024):
+                          count+=len(data);require(count<=p['size'],'Oversized part')
+                          digest.update(data);whole.update(data);output.write(data)
+                  require(count==p['size'] and digest.hexdigest()==p['sha256'],'Corrupt or truncated part: '+p['name'])
+                  total+=count
+              require(total==manifest['size'] and whole.hexdigest()==manifest['sha256'],'Assembled digest mismatch')
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,request,*args,**kwargs):return None
+          
+          def main():
+              require(os.environ.get('GITHUB_REPOSITORY')==REPOSITORY,'Wrong repository')
+              release_id=os.environ['TARGET_RELEASE_ID'];source_id=os.environ['SOURCE_RELEASE_ID'];expected=os.environ['MANIFEST_SHA256']
+              require(re.fullmatch('[1-9][0-9]*',release_id) and re.fullmatch('[1-9][0-9]*',source_id) and release_id!=source_id and re.fullmatch('[a-f0-9]{64}',expected),'Invalid dispatch inputs')
+              token=os.environ['GH_TOKEN']
+              headers={'Authorization':'Bearer '+token,'User-Agent':'WarmCorner-Archive-Assembly','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10'}
+              def get_json(suffix):
+                  with urllib.request.urlopen(urllib.request.Request(API+suffix,headers=headers),timeout=60) as response:return json.load(response)
+              def download(asset):
+                  request=urllib.request.Request(API+'/releases/assets/'+str(asset['id']),headers=dict(headers,Accept='application/octet-stream'))
+                  try:return urllib.request.build_opener(NoRedirect()).open(request,timeout=120)
+                  except urllib.error.HTTPError as error:
+                      if error.code not in (301,302,303,307,308):raise
+                      location=error.headers['Location'];parsed=urllib.parse.urlparse(location)
+                      require(parsed.scheme=='https' and parsed.hostname in ('release-assets.githubusercontent.com','objects.githubusercontent.com'),'Unexpected download redirect')
+                      # The signed storage URL needs no GitHub authorization header.
+                      return urllib.request.urlopen(location,timeout=120)
+              def release():
+                  r=get_json('/releases/'+release_id)
+                  require(r['draft'] and r['tag_name']==os.environ['RELEASE_TAG'],'Release changed or already published')
+                  source=get_json('/releases/'+source_id)
+                  require(source['draft'] and source['tag_name']=='upload-'+r['tag_name'],'Source release changed or published')
+                  return r
+              r=release();assets=get_json('/releases/'+source_id+'/assets?per_page=100')
+              require(len(assets)<100,'Unexpected asset count')
+              descriptors=[a for a in assets if a['name']=='upload-parts.json']
+              require(len(descriptors)==1 and 0<descriptors[0]['size']<32768,'Missing bounded part manifest')
+              desc=select_asset(assets,'upload-parts.json',descriptors[0]['size'],expected)
+              with download(desc) as stream:raw=stream.read(32769)
+              require(len(raw)==desc['size'] and hashlib.sha256(raw).hexdigest()==expected,'Manifest digest mismatch')
+              manifest=json.loads(raw);validate(manifest);require(manifest['version']==r['tag_name'],'Version mismatch')
+              existing=[a for a in get_json('/releases/'+release_id+'/assets?per_page=100') if a['name']==ARCHIVE]
+              if existing:
+                  select_asset(existing,ARCHIVE,manifest['size'],manifest['sha256']);print('Exact archive already verified; nothing overwritten.');return
+              verified={p['name']:select_asset(assets,p['name'],p['size'],p['sha256']) for p in manifest['parts']}
+              with tempfile.TemporaryDirectory(prefix='warm-corner-assembly-') as temporary:
+                  path=Path(temporary)/ARCHIVE
+                  with path.open('wb') as output:assemble(manifest,lambda p:download(verified[p['name']]),output)
+                  release() # Draft/tag must still match immediately before upload.
+                  connection=http.client.HTTPSConnection('uploads.github.com',timeout=180,blocksize=1024*1024)
+                  try:
+                      target='/repos/'+REPOSITORY+'/releases/'+release_id+'/assets?name='+ARCHIVE
+                      with path.open('rb') as stream:
+                          connection.request('POST',target,body=stream,headers=dict(headers,**{'Content-Type':'application/zip','Content-Length':str(manifest['size'])}))
+                          response=connection.getresponse();body=response.read()
+                      require(response.status==201,'Archive upload failed; inspect remote state before retrying')
+                      uploaded=json.loads(body);select_asset([uploaded],ARCHIVE,manifest['size'],manifest['sha256'])
+                  finally:connection.close()
+              fresh=get_json('/releases/'+release_id+'/assets?per_page=100')
+              select_asset(fresh,ARCHIVE,manifest['size'],manifest['sha256']);release()
+              print('Archive size and SHA256 verified. Release remains DRAFT.')
+          
+          if __name__=='__main__':main()
+          PY
